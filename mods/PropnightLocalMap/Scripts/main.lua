@@ -765,6 +765,31 @@ local function lobbySlotsDiag()
         roles[#roles + 1] = tostring(pc:GetAddress()) .. "=" .. readValue(pc, "IsKiller")
     end
     table.sort(roles)
+    -- swap diagnostic (written when it changes): AcceptSwap reads the accepter's
+    -- PS.SwapSender (a lobby pawn), takes that pawn's controller and calls
+    -- GS.SwapPlayers, which frees both slots only when GS.LobbyState holds each
+    -- player's PC.LobbyPawn
+    local state = {}
+    for _, pc in ipairs(propHuntControllers()) do
+        local ps = readObject(pc, "PlayerState")
+        local lobbyPawn = readObject(pc, "LobbyPawn")
+        local sender = ps and readObject(ps, "SwapSender")
+        local okCtl, ctl = pcall(function() return sender and sender:GetController() end)
+        local okOwn, own = pcall(function() return lobbyPawn and lobbyPawn:GetController() end)
+        state[#state + 1] = string.format("%s[%s] slot=%s killer=%s/%s lobbyPawn=%s(ctl %s) pawn=%s sender=%s(ctl %s)",
+            readString(ps, "NickNamePS") or "?", (pc:IsLocalController() and "local" or "remote"),
+            readString(pc, "LobbySlotName") or "?", readValue(pc, "IsKiller"), readValue(ps, "IsKiller"),
+            shortName(lobbyPawn), okOwn and shortName(own) or "err", shortName(readObject(pc, "Pawn")),
+            shortName(sender), okCtl and shortName(ctl) or "err")
+    end
+    table.sort(state)
+    local stateText = table.concat(state, " | ")
+    if stateText ~= lastSlotState then
+        lastSlotState = stateText
+        local gs = FindFirstOf("GS_PropHunt_C")
+        local okFree, free = pcall(function() return gs:IsKillerSlotFree() end)
+        log("Swap state: " .. stateText .. " | killer slot free=" .. tostring(okFree and free))
+    end
     local signature = table.concat(roles, ",")
     local previousKiller = lastRoles and lastRoles:match("([^,=]+)=true")
     local currentKiller = signature:match("([^,=]+)=true")
@@ -1280,8 +1305,9 @@ local endScreenClasses = {
 -- EXCEPTION_ACCESS_VIOLATION in the mod's tick, when the host left the end-of-match screens
 -- and the client was sent back to the menu). The current world is read from the engine's
 -- viewport (both live as long as the game) at the start of every tick and in the end-screen
--- notification; when it changed, every object kept between ticks is forgotten first, and the
--- creation notifications track the new world's objects. (UE4SS 3.0.1's RegisterLoadMapPreHook
+-- notification; when it changed, every object kept between ticks is forgotten first and the
+-- lists are rebuilt from the live objects (the new world's controller is created during the
+-- load, before that tick); later objects come from the creation notifications. (UE4SS 3.0.1's RegisterLoadMapPreHook
 -- throws on this game: crash at the first map load.)
 local engineRef = nil
 local worldKey = nil
@@ -1299,9 +1325,19 @@ local function checkWorld()
     end
     if not ok or not key or key == worldKey then return end
     if worldKey then
+        -- the new world's own objects were created during the load, before this tick:
+        -- the lists are rebuilt from the live objects (one scan per map change)
         controllers = {}
+        for _, class in ipairs({ "PC_PropHunt_C", "PC_MainMenu_C" }) do
+            for _, pc in pairs(FindAllOf(class) or {}) do track(controllers, pc) end
+        end
         loadedClasses = {}
-        for _, entry in ipairs(lobbyTracked) do entry.objects = {} end
+        for _, entry in ipairs(lobbyTracked) do
+            entry.objects = {}
+            if entry.registered then
+                for _, object in pairs(FindAllOf(entry.short) or {}) do track(entry.objects, object) end
+            end
+        end
         messageBoxes = {}
         if pendingInvite then pendingInvite.dialog = nil end
         slotInitials, rowSlots, rowMarks, rowPlaced, reportWindows = {}, {}, {}, {}, {}
@@ -1434,6 +1470,26 @@ local function writeMatchRecord(gi)
     if file then file:write(line); file:close() end
     log("Match recorded: " .. #players .. " players, MMR " .. tostring(info.mmrBefore) .. " -> " .. tostring(readValue(gi, "MMR")))
 end
+-- Role swap diagnostic for the match (5 s and 15 s after the start, every player):
+-- each PlayerState's role and pawn as this game sees them, with the pawn's position
+-- (a pawn that does not move between the two lines is not replicated here).
+local matchPawnLogs = 2
+local function matchPawnsDiag()
+    local gs = FindFirstOf("GS_PropHunt_C")
+    local parts = {}
+    pcall(function()
+        gs.PlayerArray:ForEach(function(_, element)
+            local ps = element:get()
+            local okPawn, pawn = pcall(function() return ps:GetPawn() end)
+            pawn = okPawn and pawn and pawn:IsValid() and pawn or nil
+            local okLoc, loc = pcall(function() return pawn:K2_GetActorLocation() end)
+            local okCtl, ctl = pcall(function() return pawn:GetController() end)
+            parts[#parts + 1] = string.format("%s killer=%s pawn=%s at %s ctl=%s", readString(ps, "NickNamePS") or "?",
+                readValue(ps, "IsKiller"), shortName(pawn), okLoc and loc and vecText(loc) or "?", okCtl and shortName(ctl) or "-")
+        end)
+    end)
+    log("Match pawns (" .. tostring(lanRole) .. "): " .. table.concat(parts, " | "))
+end
 local function countAsMatchmaking()
     local pc = localController()
     if not pc then return end
@@ -1451,8 +1507,14 @@ local function countAsMatchmaking()
         if not inMatch() then matchOver = false end
         return
     end
+    if matchPlayedAt and matchPawnLogs < 2 and os.clock() - matchPlayedAt > (matchPawnLogs == 0 and 5 or 15) then
+        matchPawnLogs = matchPawnLogs + 1
+        local okPawns, errPawns = pcall(matchPawnsDiag)
+        if not okPawns then log("Match pawns error: " .. tostring(errPawns)) end
+    end
     if inMatch() and not matchPlayedAt then
         matchPlayedAt = os.clock()
+        matchPawnLogs = 0
         local okRecord, errRecord = pcall(startMatchRecord, gameInstance)
         if not okRecord then log("Match record error: " .. tostring(errRecord)) end
         if readValue(gameInstance, "IsMatchmaking") == "false" then
