@@ -1275,6 +1275,40 @@ local endScreenClasses = {
     "/Game/Blueprints/MiniLobby/W_VictoryScreen.W_VictoryScreen_C",
     "/Game/Blueprints/MiniLobby/WBP_EndGameLevel.WBP_EndGameLevel_C",
 }
+-- A map change frees the old world's objects, and UE4SS's IsValid reads an object's own
+-- memory to answer: a reference kept across the change read freed memory (client crash,
+-- EXCEPTION_ACCESS_VIOLATION in the mod's tick, when the host left the end-of-match screens
+-- and the client was sent back to the menu). The current world is read from the engine's
+-- viewport (both live as long as the game) at the start of every tick and in the end-screen
+-- notification; when it changed, every object kept between ticks is forgotten first, and the
+-- creation notifications track the new world's objects. (UE4SS 3.0.1's RegisterLoadMapPreHook
+-- throws on this game: crash at the first map load.)
+local engineRef = nil
+local worldKey = nil
+local worldCheckLogged = false
+local function checkWorld()
+    if not (engineRef and engineRef:IsValid()) then engineRef = FindFirstOf("GameEngine") end
+    if not engineRef then return end
+    local ok, key = pcall(function()
+        local world = engineRef.GameViewport.World
+        return world:GetFullName() .. "@" .. tostring(world:GetAddress())
+    end)
+    if not worldCheckLogged then
+        worldCheckLogged = true
+        log("World change check: " .. (ok and "ok" or tostring(key)))
+    end
+    if not ok or not key or key == worldKey then return end
+    if worldKey then
+        controllers = {}
+        loadedClasses = {}
+        for _, entry in ipairs(lobbyTracked) do entry.objects = {} end
+        messageBoxes = {}
+        if pendingInvite then pendingInvite.dialog = nil end
+        slotInitials, rowSlots, rowMarks, rowPlaced, reportWindows = {}, {}, {}, {}, {}
+        endScreen = nil
+    end
+    worldKey = key
+end
 local function holdMatchRole(widget)
     if lanRole ~= "host" or not matchRole then return end
     local pc = localController()
@@ -1302,6 +1336,7 @@ local function watchEndScreens()
         if not endScreenWatched[path] and loadedClass(path) then
             endScreenWatched[path] = true
             NotifyOnNewObject(path, function(widget)
+                pcall(checkWorld)
                 endScreenAt = os.clock()
                 lastEndScreenAt = endScreenAt
                 local ok, err = pcall(holdMatchRole, widget)
@@ -1607,6 +1642,8 @@ end
 local tickDelay = 1000
 local lastSlowTick = -10
 local function gameTick()
+    local okWorld, errWorld = pcall(checkWorld)
+    if not okWorld then log("World check error: " .. tostring(errWorld)) end
     if os.clock() - lastSlowTick >= 0.9 then
         lastSlowTick = os.clock()
         local ok, err = pcall(slowTick)
