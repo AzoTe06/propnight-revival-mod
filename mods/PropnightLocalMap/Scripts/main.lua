@@ -1123,6 +1123,23 @@ end
 -- killer's back (the client still carried, the host back in first person, unable to act).
 -- The host's mod finishes the drop: killer still holding an attached survivor, Stunned?
 -- set, no chair move, no flashlight, no drop running -> DropMulti (multicast from the server).
+-- The listen-server host as a survivor. Characters move through the SmoothSync plugin
+-- (bReplicateMovement is off in KillerMasterBP and SurvivorMasterBP); the host's survivor
+-- moved on the host but its SmoothSync sent nothing to the others, who saw it standing at
+-- its spawn (it never happened before role swaps: the host was always the killer). Unreal's
+-- own movement replication is switched on for the host's survivor (checked in game: the
+-- killer sees it move, hits it, carries and drops it).
+local hostSurvivorReplicated = nil
+local function replicateHostSurvivor()
+    if lanRole ~= "host" then return end
+    local pawn = localPawn()
+    if not pawn or not pawnIs(pawn, survivorClassPath) then return end
+    local key = tostring(pawn:GetAddress())
+    if hostSurvivorReplicated == key and readValue(pawn, "bReplicateMovement") == "true" then return end
+    hostSurvivorReplicated = key
+    local ok, err = pcall(function() pawn:SetReplicateMovement(true) end)
+    log("Host survivor movement replicated: " .. (ok and "ok" or tostring(err)))
+end
 local hostDropSeen = nil
 local function finishHostDrop()
     if lanRole ~= "host" then return end
@@ -1146,6 +1163,8 @@ end
 local function fastTick()
     local okDrop, errDrop = pcall(finishHostDrop)
     if not okDrop then log("Host drop error: " .. tostring(errDrop)) end
+    local okRep, errRep = pcall(replicateHostSurvivor)
+    if not okRep then log("Host survivor replication error: " .. tostring(errRep)) end
     closeMessageBoxes(false)
     if pendingInvite and pendingInvite.dialog then
         local dialog = pendingInvite.dialog
@@ -1470,26 +1489,6 @@ local function writeMatchRecord(gi)
     if file then file:write(line); file:close() end
     log("Match recorded: " .. #players .. " players, MMR " .. tostring(info.mmrBefore) .. " -> " .. tostring(readValue(gi, "MMR")))
 end
--- Role swap diagnostic for the match (5 s and 15 s after the start, every player):
--- each PlayerState's role and pawn as this game sees them, with the pawn's position
--- (a pawn that does not move between the two lines is not replicated here).
-local matchPawnLogs = 2
-local function matchPawnsDiag()
-    local gs = FindFirstOf("GS_PropHunt_C")
-    local parts = {}
-    pcall(function()
-        gs.PlayerArray:ForEach(function(_, element)
-            local ps = element:get()
-            local okPawn, pawn = pcall(function() return ps:GetPawn() end)
-            pawn = okPawn and pawn and pawn:IsValid() and pawn or nil
-            local okLoc, loc = pcall(function() return pawn:K2_GetActorLocation() end)
-            local okCtl, ctl = pcall(function() return pawn:GetController() end)
-            parts[#parts + 1] = string.format("%s killer=%s pawn=%s at %s ctl=%s", readString(ps, "NickNamePS") or "?",
-                readValue(ps, "IsKiller"), shortName(pawn), okLoc and loc and vecText(loc) or "?", okCtl and shortName(ctl) or "-")
-        end)
-    end)
-    log("Match pawns (" .. tostring(lanRole) .. "): " .. table.concat(parts, " | "))
-end
 local function countAsMatchmaking()
     local pc = localController()
     if not pc then return end
@@ -1507,14 +1506,8 @@ local function countAsMatchmaking()
         if not inMatch() then matchOver = false end
         return
     end
-    if matchPlayedAt and matchPawnLogs < 2 and os.clock() - matchPlayedAt > (matchPawnLogs == 0 and 5 or 15) then
-        matchPawnLogs = matchPawnLogs + 1
-        local okPawns, errPawns = pcall(matchPawnsDiag)
-        if not okPawns then log("Match pawns error: " .. tostring(errPawns)) end
-    end
     if inMatch() and not matchPlayedAt then
         matchPlayedAt = os.clock()
-        matchPawnLogs = 0
         local okRecord, errRecord = pcall(startMatchRecord, gameInstance)
         if not okRecord then log("Match record error: " .. tostring(errRecord)) end
         if readValue(gameInstance, "IsMatchmaking") == "false" then
