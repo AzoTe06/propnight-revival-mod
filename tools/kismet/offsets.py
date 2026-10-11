@@ -30,6 +30,8 @@ def size(o):
         return s + NAME
     if t in ('EX_VectorConst', 'EX_RotationConst'):
         return s + 12
+    if t == 'EX_TransformConst':
+        return s + 40   # rotation quat (16) + translation (12) + scale (12)
     if t == 'EX_StringConst':
         return s + len(g('Value').encode('latin-1')) + 1
     if t == 'EX_UnicodeStringConst':
@@ -46,7 +48,7 @@ def size(o):
         return s + size(g('ReturnExpression'))
     if t == 'EX_Let':
         return s + PTR + size(g('Variable')) + size(g('Expression'))
-    if t in ('EX_LetBool', 'EX_LetObj'):
+    if t in ('EX_LetBool', 'EX_LetObj', 'EX_LetWeakObjPtr', 'EX_LetDelegate', 'EX_LetMulticastDelegate'):
         return s + size(g('VariableExpression')) + size(g('AssignmentExpression'))
     if t == 'EX_LetValueOnPersistentFrame':
         return s + PTR + size(g('AssignmentExpression'))

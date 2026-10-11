@@ -5,6 +5,17 @@ local commandFile = source:match("^(.*)/Mods/") .. "/revival-map-command.txt"
 local abbey = "/Game/Maps/GeneralLevels/Horror_Abbey/Big_Abbey/Big_Abbey_Main"
 local function log(s) print("[LocalMap] " .. s .. "\n") end
 local lanRole = nil
+-- Visibility of the game this player hosts: "private" (Custom Game, only friends get in) or
+-- "public" (quick play). Only public games are ranked (MMR, calibration, leave penalty).
+local hostVisibility = nil
+-- GI.IsMatchmaking is set by the game's quick play connection (ConnectMatchmakingGame) and only
+-- cleared by ConnectCustomGame: a player who used quick play, then hosted or joined a friend
+-- with the mod's commands, would still have it, so the game would rank that private game and
+-- give the leave penalty. Cleared whenever the mod starts or joins a game.
+local function clearMatchmakingFlag()
+    local gi = FindFirstOf("GI_Prophunt_C")
+    if gi and gi:IsValid() and gi.IsMatchmaking then pcall(function() gi:SetIsMatchMaking(false) end) end
+end
 local pollCount = 0
 local observedKiller = nil
 local observedKillerAt = 0
@@ -110,6 +121,12 @@ local lobbyTracked = {
     { class = "/Game/Blueprints/MiniLobby/LevelUI/WBP_LevelProgress.WBP_LevelProgress_C", short = "WBP_LevelProgress_C", objects = {} },
     { class = "/Game/Blueprints/MiniLobby/WBP_GameResultHighlight.WBP_GameResultHighlight_C", short = "WBP_GameResultHighlight_C", objects = {} },
     { class = "/Game/Blueprints/MiniLobby/MiniLobbyPawn.MiniLobbyPawn_C", short = "MiniLobbyPawn_C", objects = {} },
+    { class = "/Game/UI/InGameUI/SettingsWBP/SettingsSave.SettingsSave_C", short = "SettingsSave_C", objects = {} },
+    { class = "/Game/UI/InGameUI/SettingsWBP/SoundSettings.SoundSettings_C", short = "SoundSettings_C", objects = {} },
+    { class = "/Game/UI/SocialUI/WBP_DetailedFriendList.WBP_DetailedFriendList_C", short = "WBP_DetailedFriendList_C", objects = {} },
+    { class = "/Game/UI/SocialUI/WBP_FriendEntry.WBP_FriendEntry_C", short = "WBP_FriendEntry_C", objects = {} },
+    { class = "/Game/UI/SocialUI/WBP_SocialUI.WBP_SocialUI_C", short = "WBP_SocialUI_C", objects = {} },
+    { class = "/Game/UI/SocialUI/WBP_SelfInfo.WBP_SelfInfo_C", short = "WBP_SelfInfo_C", objects = {} },
 }
 local function lobbyObjects(index)
     local entry = lobbyTracked[index]
@@ -462,12 +479,14 @@ local hostMaps = {
     SummerCampMRG = "/Game/Maps/GeneralLevels/Reborn_Bigcamp/PN_SummerBigCamp_Arena_Main_MRG",
     YagaMap = "/Game/Maps/GeneralLevels/Reborn_Yaga/Yaga_MAIN_",
     Kitchen = "/Game/Maps/GeneralLevels/Reborn_kitchen/NewCastle_Main",
+    -- Added by the game's last build (11260535, May 2023): "Goldhorn Mine".
+    GoldenMine = "/Game/Maps/GeneralLevels/Reborn_Golden_Mine/GoldenM_Main",
     -- Maps restored by the Propnight-WindowsNoEditor_RevivalMaps_P.pak mod pak,
     -- which also lists them in the selector (DT_LevelsReverse GameMode set to 2).
     -- From the October 2022 build (v4.0.0). Its Small Abbey is not listed: the
-    -- current Big Abbey is used instead.
+    -- current Big Abbey is used instead. Its Summer Camp is not
+    -- listed either: the last build has its own Camp (SummerCampMRG).
     MansionReborn = "/Game/Maps/GeneralLevels/Reborn_Mansion/Reborn_Mansion_MAIN",
-    CampArena = "/Game/Maps/GeneralLevels/PN_SummerCamp_VER2/Camp_Arena/PN_SummerCamp_Arena_Main",
     -- From the February 2022 build (v2.0.1), without event decorations; the farm
     -- is the daytime version.
     Farm = "/Game/Maps/GeneralLevels/PropNight_Map_TEST3_Farm_Day_MERGED",
@@ -596,8 +615,12 @@ local function showInvite(command)
     port = tonumber(port)
     if not port then log("Invalid invite: " .. command); return end
     if classic == "1" and not classicMaps then showMissingMaps(map, from); return end
-    -- already in that game (opening it again while connected to it crashed the game)
-    if currentServer and currentServer:match(":(%d+)$") == tostring(port) then
+    -- already in that game (opening it again while connected to it crashed the game). Only while
+    -- in a game: the relay gives the lowest free port again, so a new game of the same host often
+    -- has the port of the one this player just left (back in the menu, currentServer is still set)
+    local pcNow = localController()
+    local inMenu = not pcNow or pcNow:GetFullName():find("PC_MainMenu_C", 1, true) ~= nil
+    if not inMenu and currentServer and currentServer:match(":(%d+)$") == tostring(port) then
         log("Invite from " .. from .. " ignored: already in that game")
         return
     end
@@ -631,10 +654,375 @@ local function showInvite(command)
     end
     log("Invite from " .. from .. " shown (port " .. port .. ")")
 end
+-- Squad invite (launcher: "squadinvite NAME"): the same JOIN / IGNORE dialog; the answer goes back
+-- to the launcher (Win64/revival-social-actions.txt), which tells the revival server.
+local function socialAction(line)
+    local file = io.open(win64 .. "/revival-social-actions.txt", "a")
+    if file then file:write(line .. "\n"); file:close() end
+    log("Social action for the launcher: " .. line)
+end
+local function showSquadInvite(from)
+    if not from or from == "" then return end
+    closeMessageBoxes(true)
+    if pendingInvite and pendingInvite.dialog then pcall(function() pendingInvite.dialog:RemoveFromParent() end) end
+    pendingInvite = { squad = true, expires = os.clock() + 60, from = from }
+    local pc = localController()
+    local ok, err = pcall(function()
+        local cls = inviteDialogClass()
+        if not cls then error("dialog class not found") end
+        local dialog = StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary"):Create(pc, cls, pc)
+        local root = dialog.WidgetTree.RootWidget
+        local label = findWidget(root, "TextBlock_37")
+        if not label then error("dialog label not found") end
+        label:SetText(FText(from .. " invites you to their squad\nYou will follow them into their games"))
+        pcall(function() label:SetAutoWrapText(true) end)
+        pcall(function() label:SetJustification(1) end)
+        dialog.TextBlock_Yes:SetText(FText("JOIN"))
+        pcall(function() findWidget(root, "TextBlock_130"):SetText(FText("IGNORE")) end)
+        dialog:AddToViewport(1000)
+        pcall(function() dialog:ShowLeaveLobbyDialog() end)
+        dialog:SetVisibility(0)
+        pendingInvite.dialog = dialog
+    end)
+    if not ok then
+        log("Squad invite dialog error: " .. tostring(err))
+        pendingInvite = nil
+        messageBox(from .. " invites you to their squad: accept it in the Propnight Revival launcher.", 30)
+    end
+    log("Squad invite from " .. from .. " shown")
+end
+
+-- Friends and squad in the game's own social widgets (main menu, top right), from the revival
+-- launcher (Win64/revival-social.txt: "you NAME", "friend NAME ONLINE STATUS", "squad NAME LEADER
+-- ONLINE", tab separated) instead of Steam (Goldberg has no friends):
+-- * WBP_DetailedFriendList: UE4SS 3.0.1 cannot pass the SteamFriend struct {ID, Nickname, Online}
+--   from a Lua table (AddEntry fails), but writes fields of an existing array element. The list's
+--   Friends array is grown with the game's own GenerateFakeFriends (41 entries), our friends written
+--   in, the extra entries made copies of the first friend (AddEntry skips an ID already listed),
+--   then the Online / Offline lists cleared and rebuilt by InitFriends. ID = the revival account name.
+-- Widget templates (class default WidgetTrees, under /Game/...) are skipped: only /Engine/Transient
+-- objects are on screen. Blueprint functions with an out parameter need a table for it ({}).
+-- * clicking a friend (WBP_FriendEntry: IsSendingRequest for 3 s, the game's Steam lobby invite does
+--   nothing here) invites them to the squad through the launcher;
+-- * the squad widget (WBP_SocialUI.MiniFriendList and the list's header): "Add Entry" / RemoveEntry
+--   per member, crown on the player when leading; the widget's Leave confirms -> leave the squad.
+-- per widget state (keyed by address): done = social.version applied to a friend list, fillAt = last
+-- fill, shown = squad members added, crowned = crown shown, clicks = friend click sent, leave = leave answered
+local social = { text = nil, you = nil, friends = {}, squad = {}, leader = false, version = 0,
+    done = {}, fillAt = {}, shown = {}, crowned = {}, clicks = {}, leave = {}, faces = {}, bg = {}, member = {}, nosearch = {},
+    clone = {} }
+local function readSocial()
+    local file = io.open(win64 .. "/revival-social.txt", "r")
+    if not file then return end
+    local text = file:read("*a") or ""
+    file:close()
+    if text == social.text then return end
+    local friends, squad, you, leader = {}, {}, nil, false
+    for line in text:gmatch("[^\n]+") do
+        local kind, a, b, c = line:match("^(%a+)\t([%w_%-]*)\t?([^\t]*)\t?([^\t]*)$")
+        if kind == "you" then you = a
+        elseif kind == "friend" and a ~= "" then friends[#friends + 1] = { name = a, online = b == "1", status = c }
+        elseif kind == "squad" and a ~= "" then squad[#squad + 1] = { name = a, leader = b == "1", online = c == "1" } end
+    end
+    for _, m in ipairs(squad) do if m.leader and m.name == you then leader = true end end
+    social.text, social.you, social.friends, social.squad, social.leader = text, you, friends, squad, leader
+    social.version = social.version + 1
+    log("Social list from the launcher: " .. #friends .. " friends, squad of " .. #squad)
+end
+local function onScreen(object)
+    return object:GetFullName():find("/Engine/Transient", 1, true) ~= nil
+end
+-- Avatar of the players in the squad widget and the friend list: Mods/PropnightLocalMap/avatar.png
+-- (a person silhouette), loaded once as a texture by the engine (ImportFileAsTexture2D); the
+-- engine's default texture if it cannot be read.
+local function avatarTexture()
+    if social.avatar and social.avatar:IsValid() then return social.avatar end
+    local ok, tex = pcall(function()
+        return StaticFindObject("/Script/Engine.Default__KismetRenderingLibrary"):ImportFileAsTexture2D(localController(),
+            win64 .. "/Mods/PropnightLocalMap/avatar.png")
+    end)
+    if ok and tex and tex:IsValid() then
+        social.avatar = tex
+    else
+        log("Avatar picture not loaded: " .. tostring(tex))
+        social.avatar = StaticFindObject("/Engine/EngineResources/DefaultTexture.DefaultTexture")
+    end
+    return social.avatar
+end
+local function fillFriendList(list)
+    if not onScreen(list) then return end
+    local key = tostring(list:GetAddress())
+    -- the game rebuilds the list from Steam when it opens: filled again when none of our entries is there
+    local present = false
+    for _, entry in ipairs(lobbyObjects(10)) do
+        local ok, id = pcall(function() return entry.SteamStruct.ID:ToString() end)
+        if ok and id and id ~= "" then
+            for _, f in ipairs(social.friends) do if f.name == id then present = true; break end end
+        end
+        if present then break end
+    end
+    if social.done[key] == social.version and (present or #social.friends == 0) then return end
+    if social.done[key] == social.version and os.clock() - (social.fillAt[key] or 0) < 10 then return end
+    social.done[key] = social.version
+    social.fillAt[key] = os.clock()
+    for _, box in ipairs({ "WBP_FriendsComboBox_Online", "WBP_FriendsComboBox_Offline", "WBP_FriendsComboBox_Search" }) do
+        pcall(function() list[box]:Clear() end)
+    end
+    local friends = social.friends
+    if #friends == 0 then log("Game friend list: no friends"); return end
+    local ok, err = pcall(function()
+        for _ = 1, 6 do
+            if list.Friends:GetArrayNum() >= #friends then break end
+            list:GenerateFakeFriends()
+        end
+        local n = list.Friends:GetArrayNum()
+        for i = 1, n do
+            local f = friends[i] or friends[1]
+            local element = list.Friends[i]
+            element.ID = f.name
+            element.Nickname = f.name
+            element.Online = f.online
+        end
+        list:InitFriends()
+        -- emptied then filled again, an open section kept the height it had empty (entries squashed):
+        -- opened again, it measures its entries
+        for _, box in ipairs({ list.WBP_FriendsComboBox_Online, list.WBP_FriendsComboBox_Offline }) do
+            if box.IsExpanded then box:Expand() end
+        end
+    end)
+    log("Game friend list filled with " .. #friends .. " friends: " .. (ok and "ok" or tostring(err)))
+end
+local function watchFriendClicks()
+    for _, entry in ipairs(lobbyObjects(10)) do
+        local key = tostring(entry:GetAddress())
+        local okSend, sending = pcall(function() return onScreen(entry) and entry.IsSendingRequest end)
+        if okSend and sending then
+            if not social.clicks[key] then
+                social.clicks[key] = true
+                local ok, id = pcall(function() return entry.SteamStruct.ID:ToString() end)
+                local member = false
+                for _, m in ipairs(social.squad) do if m.name == id then member = true end end
+                if ok and id and id:match("^[%w_%-]+$") and not member then socialAction("invite " .. id) end
+                social.steamLeaveAt = os.clock() + 4
+            end
+        else
+            social.clicks[key] = nil
+        end
+    end
+end
+local function syncSquadWidget(ui)
+    if not onScreen(ui) then return end
+    local key = tostring(ui:GetAddress())
+    -- members (the player excepted) in the squad's order; the leader's slot wears the crown
+    local order, leaderName = {}, nil
+    for _, m in ipairs(social.squad) do
+        if m.leader then leaderName = m.name end
+        if m.name ~= social.you then order[#order + 1] = m.name end
+    end
+    if social.leftAt and os.clock() - social.leftAt < 15 then order = {} end
+    local lists = {}
+    pcall(function() lists[#lists + 1] = ui.MiniFriendList end)
+    pcall(function() lists[#lists + 1] = ui.WBP_DetailedFriendList.WBP_DetailedFriendListHeader end)
+    -- any change rebuilds both rows: a removed slot goes to the end of the widget's free-slot queue
+    -- (EmptySlots), so the next member skipped the hole; emptied, then LeaveLobby (which queues every
+    -- slot in order), the members are added again from the first slot
+    local wantKey = table.concat(order, ",")
+    if social.shown[key] ~= wantKey then
+        social.shown[key] = wantKey
+        social.crowned[key] = nil
+        for _, list in ipairs(lists) do
+            pcall(function() list.EmptySlots:Empty() end)
+            pcall(function() list:LeaveLobby() end)
+            for _, name in ipairs(order) do
+                pcall(function() list["Add Entry"](list, name, name, avatarTexture(), {}) end)
+            end
+        end
+        log("Squad widget: " .. (wantKey ~= "" and wantKey or "no one"))
+    end
+    -- online friends count next to the squad (the game counted Steam friends: always 0)
+    local online = 0
+    for _, f in ipairs(social.friends) do if f.online then online = online + 1 end end
+    pcall(function() ui.MiniFriendList.TextBlock_FriendsCount:SetText(FText(tostring(online))) end)
+    local crownKey = tostring(social.leader and #social.squad > 1) .. "|" .. tostring(leaderName) .. "|" .. wantKey
+    if social.crowned[key] ~= crownKey then
+        social.crowned[key] = crownKey
+        pcall(function() ui.MiniFriendList.WBP_SelfInfo_67:SetIsCrowned(social.leader and #social.squad > 1) end)
+        for _, list in ipairs(lists) do
+            for i = 0, 6 do
+                pcall(function()
+                    local slot = list["WBP_MiniFriendEntry_" .. i]
+                    local id = slot.SteamID:ToString()
+                    slot:SetIsCrowned(id ~= "" and id == leaderName)
+                end)
+            end
+        end
+    end
+    -- Leave: the widget's own button (WBP_SelfInfo.Button_LeaveLobby) only opens the confirmation when
+    -- the game is in a Steam lobby (GetAmILobbyMember, none here): a click (the button takes the
+    -- keyboard focus) opens it for the squad. Its "Yes" runs the game's leave, which empties the squad
+    -- slots (MiniFriendList.LeaveLobby -> ClearSlotData): seen here, the launcher leaves the squad.
+    -- The button is the player's own avatar in the squad widget: hovering it swaps the avatar for the
+    -- leave icon (ChangeIcons_Anim), which the game also only does in a Steam lobby: done here too.
+    local okHovered, hovered = pcall(function() return ui.MiniFriendList.WBP_SelfInfo_67.Button_LeaveLobby:IsHovered() end)
+    hovered = okHovered and hovered and #social.squad > 1
+    if hovered ~= (social.leaveIcon or false) then
+        social.leaveIcon = hovered
+        pcall(function()
+            local self = ui.MiniFriendList.WBP_SelfInfo_67
+            if hovered then self:PlayAnimationForward(self.ChangeIcons_Anim, 1.0, false)
+            else self:PlayAnimationReverse(self.ChangeIcons_Anim, 1.0, false) end
+        end)
+    end
+    local okFocus, focused = pcall(function() return ui.MiniFriendList.WBP_SelfInfo_67.Button_LeaveLobby:HasKeyboardFocus() end)
+    focused = okFocus and focused
+    local okDialog, dialog = pcall(function() return ui.WBP_LeaveTeamDialog_358 end)
+    if focused and not social.leave[key] and #social.squad > 1 then
+        pcall(function() ui:LeavePressed() end)
+        pcall(function() dialog.Button_No:SetKeyboardFocus() end)   -- a Yes focused from before is not an answer
+    end
+    social.leave[key] = focused
+    -- the dialog's Yes does nothing outside a Steam lobby either (it stays open): a click on it (focus)
+    -- leaves the squad here, closes the dialog and empties the squad widgets at once
+    if okDialog and dialog and dialog:IsValid() and #social.squad > 1 then
+        local okVis, vis = pcall(function() return dialog:GetVisibility() end)
+        local okYes, yes = pcall(function() return dialog.Button_Yes:HasKeyboardFocus() end)
+        if okVis and vis ~= 1 and vis ~= 2 and okYes and yes then
+            log("Squad left from the game's widget")
+            socialAction("leave")
+            pcall(function() dialog:SetVisibility(1) end)
+            pcall(function() ui.MiniFriendList:LeaveLobby() end)
+            pcall(function() ui.WBP_DetailedFriendList.WBP_DetailedFriendListHeader:LeaveLobby() end)
+            social.shown[key] = ""
+            social.squad, social.leader = {}, false
+            social.leftAt = os.clock()
+            social.version = social.version + 1   -- friend list entries lose their squad mark
+        end
+    end
+end
+-- The player's own avatar (WBP_SelfInfo.Image_SelfAvatar) and each friend list entry's avatar
+-- (WBP_FriendEntry.WBP_MiniFriendEntry_ForList.Image_Avatar, a black square) had no picture (no Steam
+-- avatars with Goldberg): the same avatar picture. Squad slots get it through "Add Entry"; empty
+-- slots keep their "+". avatar.png is 96 px, grey (the game's white "+" on hover stays visible), the shape in alpha only (no dark fringe when the
+-- engine scales it down: the texture has no mipmaps).
+local function showAvatars()
+    local tex = avatarTexture()
+    if not tex then return end
+    local function apply(widget, image)
+        local key = tostring(widget:GetAddress())
+        if social.faces[key] or not onScreen(widget) then return end
+        social.faces[key] = true
+        pcall(function() image(widget):SetBrushFromTexture(tex, false) end)
+    end
+    for _, widget in ipairs(lobbyObjects(12)) do apply(widget, function(w) return w.Image_SelfAvatar end) end
+    for _, widget in ipairs(lobbyObjects(9)) do apply(widget, function(w) return w.Image_Self_Avatar end) end
+    for _, widget in ipairs(lobbyObjects(10)) do apply(widget, function(w) return w.WBP_MiniFriendEntry_ForList.Image_Avatar end) end
+    -- hovering an entry (WBP_MiniFriendEntry_ForList) showed an overlay on the avatar (Overlay_Hover: a
+    -- black layer, a blur and a "+") and darkened its background (Image_BG), which the unhover left
+    -- white and transparent (the avatar then sat on black): the overlay's children are hidden, and the
+    -- background gets its own colour back whenever the pointer is not on it
+    for _, widget in ipairs(lobbyObjects(10)) do
+        if onScreen(widget) then
+            local key = tostring(widget:GetAddress())
+            local forList = widget.WBP_MiniFriendEntry_ForList
+            -- black layer and blur always hidden; the "+" (Image_63: invite) only for friends outside the squad
+            local okId, id = pcall(function() return widget.SteamStruct.ID:ToString() end)
+            local member = false
+            for _, m in ipairs(social.squad) do if okId and m.name == id and m.name ~= social.you then member = true end end
+            local want = member and "member" or "friend"
+            if social.bg[key] ~= want then
+                social.bg[key] = want
+                pcall(function()
+                    local overlay = forList.Overlay_Hover
+                    for i = 0, overlay:GetChildrenCount() - 1 do
+                        local child = overlay:GetChildAt(i)
+                        local plus = child:GetFName():ToString() == "Image_63"
+                        child:SetVisibility((plus and not member) and 4 or 2)
+                    end
+                end)
+            end
+            local okHover, hovered = pcall(function() return forList.Overlay_Hover:GetVisibility() == 4 end)
+            if okHover and not hovered then
+                pcall(function() forList.Image_BG:SetColorAndOpacity({ R = 0.05448, G = 0.05448, B = 0.05448, A = 0.298039 }) end)
+            end
+        end
+    end
+    -- squad members are shown as in the team (WBP_FriendEntry.Accepted: team icon, no invite on click)
+    local inSquad = {}
+    for _, m in ipairs(social.squad) do if m.name ~= social.you then inSquad[m.name] = true end end
+    for _, widget in ipairs(lobbyObjects(10)) do
+        if onScreen(widget) then
+            local key = tostring(widget:GetAddress())
+            local okId, id = pcall(function() return widget.SteamStruct.ID:ToString() end)
+            local member = okId and inSquad[id] or false
+            if member and not social.member[key] then
+                social.member[key] = true
+                pcall(function() widget:Accepted() end)
+            elseif not member and social.member[key] then
+                social.member[key] = nil
+                pcall(function() widget:LeftLobby() end)
+                pcall(function() widget:SetIsInvitationAcceptedToFalse() end)
+            end
+        end
+    end
+end
+-- The list's search bar (SizeBox_133: Steam friend search) is hidden: friends are added by code
+-- in the launcher.
+-- A click on a friend also runs the game's Steam lobby invite: Goldberg makes a real (empty) Steam
+-- lobby, and the game then shows its own squad block with a leave cross. That lobby is left a few
+-- seconds after each click (GI.LeaveLobby); its leave also empties the squad widget, which is filled
+-- again from the revival squad.
+local function leaveSteamLobby()
+    -- the lobby is made asynchronously: also left whenever the friend list's leave cross shows
+    -- (WBP_DetailedFriendListHeader.Button_LeaveLobby, visible only in a Steam lobby)
+    for _, list in ipairs(lobbyObjects(9)) do
+        if onScreen(list) then
+            local ok, vis = pcall(function() return list.WBP_DetailedFriendListHeader.Button_LeaveLobby:GetVisibility() end)
+            if ok and vis == 0 and not social.steamLeaveAt then social.steamLeaveAt = os.clock() end
+        end
+    end
+    if not social.steamLeaveAt or os.clock() < social.steamLeaveAt then return end
+    social.steamLeaveAt = nil
+    local ok, err = pcall(function()
+        local gi = StaticFindObject("/Script/Engine.Default__GameplayStatics"):GetGameInstance(localController())
+        gi:LeaveLobby()
+    end)
+    social.shown, social.crowned = {}, {}
+    log("Game's own Steam lobby left after an invite: " .. (ok and "ok" or tostring(err)))
+end
+local function hideFriendSearch()
+    for _, list in ipairs(lobbyObjects(9)) do
+        local key = tostring(list:GetAddress())
+        if not social.nosearch[key] and onScreen(list) then
+            social.nosearch[key] = true
+            local ok = pcall(function() list.EditableTextBox_SearchLine:GetParent():GetParent():GetParent():SetVisibility(1) end)
+            log("Friend list search bar hidden: " .. tostring(ok))
+        end
+    end
+end
+local function socialSync()
+    local pc = localController()
+    if not pc or not pc:GetFullName():find("PC_MainMenu_C", 1, true) then return end
+    readSocial()
+    if not social.text then return end
+    for _, list in ipairs(lobbyObjects(9)) do
+        local ok, err = pcall(fillFriendList, list)
+        if not ok then log("Game friend list error: " .. tostring(err)) end
+    end
+    local okClicks, errClicks = pcall(watchFriendClicks)
+    if not okClicks then log("Friend click error: " .. tostring(errClicks)) end
+    for _, ui in ipairs(lobbyObjects(11)) do
+        local ok, err = pcall(syncSquadWidget, ui)
+        if not ok then log("Squad widget error: " .. tostring(err)) end
+    end
+    pcall(hideFriendSearch)
+    pcall(leaveSteamLobby)
+    local okFaces, errFaces = pcall(showAvatars)
+    if not okFaces then log("Avatar picture error: " .. tostring(errFaces)) end
+end
 local aliveFile = win64 .. "/revival-hosting.txt"
-local function touchAliveFile()
+local function touchAliveFile(content)
     local file = io.open(aliveFile, "w")
-    if file then file:write(tostring(os.time())); file:close() end
+    if file then file:write(content or tostring(os.time())); file:close() end
 end
 local function shellSafe(text)
     return (tostring(text or ""):gsub("[^%w _%-%.]", ""))
@@ -642,7 +1030,8 @@ end
 -- The players' traffic reaches this listen server through the revival relay:
 -- RevivalRelay.exe registers the game (listed in the in-game server browser)
 -- and tunnels the relay to 127.0.0.1:7777; the host's IP is never shown.
-local function startRelayAgent(mapName)
+-- visibility: "private" (Custom Game: not listed, only the host's friends get in) or "public" (quick play)
+local function startRelayAgent(mapName, visibility)
     local name = ""
     local ok, value = pcall(function() return localController().PlayerState:GetPlayerName():ToString() end)
     if ok and value then name = shellSafe(value) end
@@ -659,11 +1048,13 @@ local function startRelayAgent(mapName)
         steamId = (idFile:read("*l") or ""):match("^%s*(%d+)%s*$") or ""
         idFile:close()
     end
-    local command = string.format('start "" "%s" --api %s --name "%s" --map %s --alive-file "%s"%s',
-        exe, api, name, shellSafe(mapName), alive, steamId ~= "" and (" --steam " .. steamId) or "")
+    local args = string.format('--api %s --name "%s" --map %s --alive-file "%s" --visibility %s%s',
+        api, name, shellSafe(mapName), alive, visibility == "public" and "public" or "private", steamId ~= "" and (" --steam " .. steamId) or "")
     log("Starting relay agent for " .. name .. " on " .. shellSafe(mapName))
-    -- Off the game thread: the first launch of the exe can take seconds.
-    ExecuteWithDelay(10, function() os.execute(command) end)
+    -- Off the game thread: the first launch of the exe can take seconds. (Launcher 1.13.3 started
+    -- it without cmd's brief console window; Windows Defender flagged that launcher as
+    -- Trojan:Win32/Wacatac, a false positive, so cmd is used again.)
+    ExecuteWithDelay(10, function() os.execute(string.format('start "" "%s" %s', exe, args)) end)
 end
 -- The menu's PlayFab component calls setPlayFabSettings(…, "https://23b52.playfabapi.com/")
 -- in BeginPlay; the same call is made again with the revival URL afterwards.
@@ -694,10 +1085,11 @@ local function hostFromMenu(mapName)
         log("Create game: unknown or missing map selection (" .. tostring(mapName) .. "), using BigAbbey")
         mapName, path = "BigAbbey", hostMaps.BigAbbey
     end
-    lanRole = "host"
+    lanRole, hostVisibility = "host", "private"
+    clearMatchmakingFlag()
     log("Create game from menu: " .. mapName .. " -> " .. path)
     if online then
-        local ok, err = pcall(startRelayAgent, mapName)
+        local ok, err = pcall(startRelayAgent, mapName, "private")
         if not ok then log("Relay agent error: " .. tostring(err)) end
     end
     executeCommand("open " .. path .. "?listen?port=7777")
@@ -1123,22 +1515,84 @@ end
 -- killer's back (the client still carried, the host back in first person, unable to act).
 -- The host's mod finishes the drop: killer still holding an attached survivor, Stunned?
 -- set, no chair move, no flashlight, no drop running -> DropMulti (multicast from the server).
--- The listen-server host as a survivor. Characters move through the SmoothSync plugin
--- (bReplicateMovement is off in KillerMasterBP and SurvivorMasterBP); the host's survivor
--- moved on the host but its SmoothSync sent nothing to the others, who saw it standing at
--- its spawn (it never happened before role swaps: the host was always the killer). Unreal's
--- own movement replication is switched on for the host's survivor (checked in game: the
--- killer sees it move, hits it, carries and drops it).
-local hostSurvivorReplicated = nil
-local function replicateHostSurvivor()
+-- The listen-server host's own pawn (survivor, prop) never sent its SmoothSync state (the
+-- game's modified plugin only lets owning clients send, the server relays): fixed by the
+-- SmoothSyncListenHostSends patch of Propnight.exe. (Unreal's movement replication must stay off:
+-- with both, the host's survivor jumped around on the clients.)
+-- Maddy (Nina) as the listen-server host killer: after a katana blink the killer stayed frozen and
+-- the katana never came back. The spell (KatanaBlinkSpell) runs its local-player branch and its
+-- server branch on the same object on a host (two separate copies on a dedicated server), and its
+-- chain of delays left StopMove?/LockMouseInput set. When the host's Maddy stays locked for 4 s
+-- without aiming, the state is logged and the spell is reset (its own ResetSpell_Event) and the
+-- movement given back, as the end of the blink does.
+-- Seen (2026-10-10): StopMove? stays true with spell SpellUse/Teleport true after the teleport (the end
+-- of the blink never runs). A jump of the killer (teleport) followed by a lock is reset after 1 s.
+local maddyLock = { since = nil, done = false, pos = nil, jumped = false }
+local function unlockHostMaddy()
     if lanRole ~= "host" then return end
-    local pawn = localPawn()
-    if not pawn or not pawnIs(pawn, survivorClassPath) then return end
-    local key = tostring(pawn:GetAddress())
-    if hostSurvivorReplicated == key and readValue(pawn, "bReplicateMovement") == "true" then return end
-    hostSurvivorReplicated = key
-    local ok, err = pcall(function() pawn:SetReplicateMovement(true) end)
-    log("Host survivor movement replicated: " .. (ok and "ok" or tostring(err)))
+    local killer = localKiller()
+    if not killer or not killer:GetFullName():find("Nina_C", 1, true) then maddyLock.since, maddyLock.active = nil, false; return end
+    maddyLock.active = true  -- the mod ticks every 250 ms while the host plays Maddy
+    local spell = readObject(killer, "KatanaBlinkSpell")
+    if not spell or not spell:IsValid() then return end
+    local okPos, pos = pcall(function() return killer:K2_GetActorLocation() end)
+    local jump = false
+    if okPos and maddyLock.pos then
+        local dx, dy, dz = pos.X - maddyLock.pos.X, pos.Y - maddyLock.pos.Y, pos.Z - maddyLock.pos.Z
+        jump = dx * dx + dy * dy + dz * dz > 400 * 400
+    end
+    if okPos then maddyLock.pos = { X = pos.X, Y = pos.Y, Z = pos.Z } end
+    -- the spell's Teleport flag is set by the teleport and cleared by ResetSpell_Event below; it is
+    -- watched on every check, so a teleport that happened before the lock was noticed still counts
+    -- (a throw straight up teleports by a few centimetres only, too little to see as a jump)
+    local teleported = readValue(spell, "Teleport") == "true"
+    jump = jump or (teleported and maddyLock.prevTeleport == false)
+    if jump then maddyLock.jumpAt = os.clock() end
+    maddyLock.prevTeleport = teleported
+    local locked = readValue(killer, "StopMove?") == "true" or readValue(killer, "LockMouseInput") == "true"
+    local aiming = readValue(spell, "PressedRMB") == "true" or readValue(spell, "ChargeInProgressOrCharged") == "true"
+    -- only the katana's own lock: a flashlight stun (Stunned?/Flashed) is the game's, left alone
+    local katanaLock = readValue(killer, "Spell?") == "true" or readValue(spell, "SpellUse") == "true"
+    local busy = readObject(killer, "GrabbedChar") ~= nil or not katanaLock
+        or readValue(killer, "Stunned?") == "true" or readValue(killer, "Flashed") == "true"
+    if not locked or aiming or busy then maddyLock.since, maddyLock.done, maddyLock.jumped = nil, false, jump; return end
+    maddyLock.jumped = maddyLock.jumped or jump
+    if not maddyLock.since then maddyLock.since = os.clock(); return end
+    if maddyLock.done then return end
+    local lockedFor = os.clock() - maddyLock.since
+    -- no katana in flight any more (KatanaBlink actors: Hitted is set when it lands): a throw that
+    -- did not teleport also ends here, without waiting
+    local flying = false
+    for _, katana in pairs(FindAllOf("KatanaBlink_C") or {}) do
+        if katana:IsValid() and readValue(katana, "Hitted") ~= "true" then flying = true end
+    end
+    -- after a teleport the game's own end of the blink takes about 0.35 s (Post-proccessDelay 0.165,
+    -- BackToIdleDelay 0.2): the katana is given back 0.3 s after the teleport was seen
+    if maddyLock.jumped then
+        if os.clock() - (maddyLock.jumpAt or maddyLock.since) < 0.3 then return end
+    elseif lockedFor < ((not flying) and 0.5 or 4) then return end
+    maddyLock.done = true
+    local state = {}
+    for _, field in ipairs({ "StopMove?", "LockMouseInput", "UnStunned", "Stunned?", "Spell?", "AttackBlocked?", "Atack?", "Freeze" }) do
+        state[#state + 1] = field .. "=" .. tostring(readValue(killer, field))
+    end
+    for _, field in ipairs({ "SpellUse", "Teleport", "Charged", "ValidLaunch", "SoftResetProcess", "HardResetProcess" }) do
+        state[#state + 1] = "spell." .. field .. "=" .. tostring(readValue(spell, field))
+    end
+    local okReset, errReset = pcall(function() spell:ResetSpell_Event() end)
+    maddyLock.prevTeleport = readValue(spell, "Teleport") == "true"
+    pcall(function() killer["StopMove?"] = false end)
+    -- KillerMasterBP's attack (CustomLMB) is refused while Spell? is set; the spell sets it at the
+    -- throw and clears it only in the end of the blink that did not run
+    pcall(function() killer["Spell?"] = false end)
+    pcall(function() spell.SpellUse = false end)
+    pcall(function() killer:ChangeNinaSpeed(false) end)
+    pcall(function() killer.LockMouseInput = false end)
+    pcall(function() killer:KatanaAppear() end)
+    log("Host Maddy locked after the katana (" .. (maddyLock.jumped and "after a teleport, " or (flying and "katana still flying, " or "katana landed, "))
+        .. table.concat(state, " ") .. "): reset "
+        .. (okReset and "ok" or tostring(errReset)) .. ", now StopMove?=" .. tostring(readValue(killer, "StopMove?"))
+        .. " LockMouseInput=" .. tostring(readValue(killer, "LockMouseInput")) .. " Spell?=" .. tostring(readValue(killer, "Spell?")))
 end
 local hostDropSeen = nil
 local function finishHostDrop()
@@ -1160,11 +1614,43 @@ local function finishHostDrop()
     local ok, err = pcall(function() killer:DropMulti() end)
     log("Host killer drop finished (DropMulti): " .. (ok and "ok" or tostring(err)))
 end
+-- Lobby swap request missed by a client killer (public games: the host starts as a survivor).
+-- A survivor's request sets the killer's PS.SwapSender (replicated) and calls the killer's
+-- SendSwapRequestToKiller_Client -> W_MiniLobby.SurvivorWantsToSwap, which only arms the button
+-- (bIsSwapRequestSended: the next click is AcceptSwap) when the client's PC.IsKiller is true and
+-- the sender's PlayerState is known there. When the widget did not arm it, the killer's click sent
+-- a request of its own and nothing happened. The client arms it from the replicated SwapSender.
+local swapSeen = { key = nil, at = 0, done = false }
+local function showMissedSwapRequest()
+    if lanRole ~= "client" or inMatch() then return end
+    local pc = localController()
+    if not pc or readValue(pc, "IsKiller") ~= "true" then return end
+    local ps = readObject(pc, "PlayerState")
+    local sender = ps and readObject(ps, "SwapSender")
+    if not sender or not sender:IsValid() then swapSeen.key = nil; return end
+    local key = sender:GetFullName()
+    if swapSeen.key ~= key then swapSeen.key, swapSeen.at, swapSeen.done = key, os.clock(), false end
+    if swapSeen.done or os.clock() - swapSeen.at < 1.5 then return end
+    swapSeen.done = true
+    local okHud, hud = pcall(function() return pc:GetHUD() end)
+    local mini = okHud and hud and readObject(hud, "MiniLobby")
+    if not mini or not mini:IsValid() then log("Swap request seen without a lobby widget"); return end
+    if mini.bIsSwapRequestSended then return end
+    local okCall, errCall = pcall(function() mini:SurvivorWantsToSwap(sender) end)
+    local armed = mini.bIsSwapRequestSended
+    if not armed then
+        mini.bIsSwapRequestSended = true
+        mini.bIsSwapBlocked = false
+        pcall(function() mini.Button_CancelSwap:SetVisibility(0) end)
+    end
+    log("Swap request from " .. shortName(sender) .. " armed on the killer's lobby button: widget "
+        .. (okCall and (armed and "ok" or "did not arm it, set directly") or tostring(errCall)))
+end
 local function fastTick()
     local okDrop, errDrop = pcall(finishHostDrop)
+    local okMaddy, errMaddy = pcall(unlockHostMaddy)
+    if not okMaddy then log("Host Maddy check error: " .. tostring(errMaddy)) end
     if not okDrop then log("Host drop error: " .. tostring(errDrop)) end
-    local okRep, errRep = pcall(replicateHostSurvivor)
-    if not okRep then log("Host survivor replication error: " .. tostring(errRep)) end
     closeMessageBoxes(false)
     if pendingInvite and pendingInvite.dialog then
         local dialog = pendingInvite.dialog
@@ -1174,6 +1660,7 @@ local function fastTick()
             inviteKeyPressed = true
         elseif not okVis or vis == 1 or not dialog:IsValid() then
             log("Invite from " .. pendingInvite.from .. " ignored")
+            if pendingInvite.squad then socialAction("decline " .. pendingInvite.from) end
             pcall(function() dialog:RemoveFromParent() end)
             pendingInvite = nil
         end
@@ -1186,7 +1673,8 @@ local function fastTick()
             closeMessageBoxes(true)
             if invite.dialog then pcall(function() invite.dialog:RemoveFromParent() end) end
             log("Invite from " .. invite.from .. " accepted")
-            queuedCommand = "joinrelay " .. invite.port
+            if invite.squad then socialAction("accept " .. invite.from)
+            else queuedCommand = "joinrelay " .. invite.port end
         end
     elseif pendingInvite and os.clock() > pendingInvite.expires then
         if pendingInvite.dialog then pcall(function() pendingInvite.dialog:RemoveFromParent() end) end
@@ -1199,6 +1687,8 @@ local function fastTick()
         if not ok then log("Lobby slots diagnostic error: " .. tostring(err)) end
         local okReports, errReports = pcall(watchReports)
         if not okReports then log("Report watch error: " .. tostring(errReports)) end
+        local okSwap, errSwap = pcall(showMissedSwapRequest)
+        if not okSwap then log("Swap request error: " .. tostring(errSwap)) end
         local okSlots, errSlots = pcall(registerLobbyPlayers)
         if not okSlots then log("Lobby player registration error: " .. tostring(errSlots)) end
         local okRow, errRow = pcall(updateLobbyRow)
@@ -1218,6 +1708,46 @@ end
 -- blueprints load their sublevels as a chain, so it is removed only once every
 -- sublevel has loaded.
 local cleanedWorld = nil
+-- The October 2022 House (Reborn_Mansion) dresses its character-select scene with the
+-- Halloween sublevel (hundreds of decorations within a few metres of it): there it is kept
+-- during the lobby and unloaded when the match starts.
+local LOBBY_HALLOWEEN = { "Reborn_Mansion" }
+local halloweenLater = nil   -- { worldId, levels }
+local function keepHalloweenInLobby(worldId)
+    for _, map in ipairs(LOBBY_HALLOWEEN) do
+        if worldId:find(map, 1, true) then return true end
+    end
+    return false
+end
+local function removeHalloweenLater()
+    if not halloweenLater or not inMatch() then return end
+    for _, streaming in ipairs(halloweenLater.levels) do
+        pcall(function() streaming:SetShouldBeVisible(false); streaming:SetShouldBeLoaded(false) end)
+    end
+    log("Halloween decoration removed at the start of the match (kept for the lobby scene)")
+    halloweenLater = nil
+end
+-- The February 2022 day farm: the current scene sets the map's fog to its FogParametr (0.1)
+-- while the lobby is shown, a thick wall of fog on this map (v2's scene did not touch the fog).
+-- The scene keeps the map's own density instead.
+local farmFogWorld = nil
+local function keepFarmFog()
+    local pc = localController()
+    local world = pc and pc:GetWorld()
+    if not world or not world:IsValid() or inMatch() then return end
+    local worldId = world:GetFullName() .. "@" .. tostring(world:GetAddress())
+    if farmFogWorld == worldId or not worldId:find("PropNight_Map_TEST3_Farm_Day", 1, true) then return end
+    local lobby = FindFirstOf("NewLobbyV2_C")
+    local fog = FindFirstOf("ExponentialHeightFog")
+    if not lobby or not lobby:IsValid() or not fog or not fog:IsValid() then return end
+    local component = fog.Component
+    local saved = lobby.SavedFog
+    local own = (type(saved) == "number" and saved > 0) and saved or component.FogDensity
+    lobby.FogParametr = own
+    component:SetFogDensity(own)
+    farmFogWorld = worldId
+    log(string.format("Day farm lobby keeps the map's fog: %.4f", own))
+end
 local function removeHalloweenSublevels()
     local world = localController() and localController():GetWorld()
     if not world or not world:IsValid() then return end
@@ -1235,9 +1765,14 @@ local function removeHalloweenSublevels()
     for _, streaming in ipairs(levels) do
         local name = streaming:GetLoadedLevel():GetFullName()
         if name:find("_Halloween", 1, true) then
-            streaming:SetShouldBeVisible(false)
-            streaming:SetShouldBeLoaded(false)
-            removed[#removed + 1] = name:match("([%w_]+):PersistentLevel") or name
+            if keepHalloweenInLobby(worldId) and not inMatch() then
+                halloweenLater = halloweenLater or { worldId = worldId, levels = {} }
+                table.insert(halloweenLater.levels, streaming)
+            else
+                streaming:SetShouldBeVisible(false)
+                streaming:SetShouldBeLoaded(false)
+                removed[#removed + 1] = name:match("([%w_]+):PersistentLevel") or name
+            end
         end
     end
     -- The February 2022 day farm keeps a Stationary sun whose baked shadow maps
@@ -1347,6 +1882,7 @@ local function checkWorld()
         -- the new world's own objects were created during the load, before this tick:
         -- the lists are rebuilt from the live objects (one scan per map change)
         controllers = {}
+        halloweenLater = nil   -- the previous world's sublevels are gone
         for _, class in ipairs({ "PC_PropHunt_C", "PC_MainMenu_C" }) do
             for _, pc in pairs(FindAllOf(class) or {}) do track(controllers, pc) end
         end
@@ -1360,6 +1896,8 @@ local function checkWorld()
         messageBoxes = {}
         if pendingInvite then pendingInvite.dialog = nil end
         slotInitials, rowSlots, rowMarks, rowPlaced, reportWindows = {}, {}, {}, {}, {}
+        social.done, social.fillAt, social.shown, social.crowned, social.clicks, social.leave, social.faces, social.bg = {}, {}, {}, {}, {}, {}, {}, {}
+        social.member, social.nosearch = {}, {}
         endScreen = nil
     end
     worldKey = key
@@ -1479,15 +2017,40 @@ local function writeMatchRecord(gi)
             players[#players + 1] = "{" .. table.concat(fields, ",") .. "}"
         end)
     end)
-    local line = string.format('{"map":%s,"role":%s,"server":%s,"killer":%s,"character":%s,"won":%s,"killerWon":%s,'
+    local line = string.format('{"map":%s,"role":%s,"server":%s,"ranked":%s,"killer":%s,"character":%s,"won":%s,"killerWon":%s,'
         .. '"startedAt":%d,"endedAt":%d,"mmrBefore":%s,"mmrAfter":%s,"matchesBefore":%s,"matchesAfter":%s,"players":[%s]}\n',
-        jsonString(info.map), jsonValue(info.role), jsonValue(info.server), tostring(info.killer), jsonValue(info.character),
+        jsonString(info.map), jsonValue(info.role), jsonValue(info.server), tostring(info.ranked == true), tostring(info.killer), jsonValue(info.character),
         tostring(info.killer == killerWon), tostring(killerWon), info.startedAt, os.time(), jsonValue(info.mmrBefore),
         jsonValue(tonumber(readValue(gi, "MMR"))), jsonValue(info.matchesBefore), jsonValue(tonumber(readValue(gi, "MatchesPlayed"))),
         table.concat(players, ","))
     local file = io.open(matchesFile, "a")
     if file then file:write(line); file:close() end
     log("Match recorded: " .. #players .. " players, MMR " .. tostring(info.mmrBefore) .. " -> " .. tostring(readValue(gi, "MMR")))
+end
+-- Only public games are ranked (MMR, calibration, daily tasks and the game's leave penalty, all
+-- behind GI.IsMatchmaking): a private game among friends changes nothing. The host knows (it chose
+-- Custom Game or was ordered to host by quick play); a player who joined reads Win64/revival-game.txt,
+-- written by the launcher from the revival server ("visibility=public|private", "port=", "at=" unix
+-- time). A missing or old file, or one about another game, counts as private.
+local gameFile = win64 .. "/revival-game.txt"
+local matchRanked = false
+local function joinedGameVisibility()
+    local file = io.open(gameFile, "r")
+    if not file then return nil end
+    local text = file:read("*a") or ""
+    file:close()
+    local visibility, port, at = text:match("visibility=(%a+)"), text:match("port=(%d+)"), tonumber(text:match("at=(%d+)"))
+    if not at or math.abs(os.time() - at) > 90 then return nil end
+    local serverPort = currentServer and currentServer:match(":(%d+)$")
+    if serverPort and port ~= serverPort then return nil end
+    return visibility
+end
+local function isPublicGame(gi, flagIsOurs)
+    if lanRole == "host" then return hostVisibility == "public", "hosted " .. tostring(hostVisibility) end
+    -- joined by the game's own quick play: only public games are offered there
+    if not flagIsOurs and readValue(gi, "IsMatchmaking") == "true" then return true, "quick play" end
+    local visibility = joinedGameVisibility()
+    return visibility == "public", "joined, launcher says " .. tostring(visibility or "nothing")
 end
 local function countAsMatchmaking()
     local pc = localController()
@@ -1510,7 +2073,19 @@ local function countAsMatchmaking()
         matchPlayedAt = os.clock()
         local okRecord, errRecord = pcall(startMatchRecord, gameInstance)
         if not okRecord then log("Match record error: " .. tostring(errRecord)) end
-        if readValue(gameInstance, "IsMatchmaking") == "false" then
+        local why
+        matchRanked, why = isPublicGame(gameInstance, matchmakingSet)
+        if matchInfo then matchInfo.ranked = matchRanked end
+        if not matchRanked then
+            -- the game ranks the match and gives the leave penalty while the flag is set
+            local ok = true
+            if readValue(gameInstance, "IsMatchmaking") == "true" then
+                ok = pcall(function() gameInstance:SetIsMatchMaking(false) end)
+            end
+            matchmakingSet = false
+            log("Private game (" .. why .. "): not ranked, no MMR / calibration / leave penalty"
+                .. (ok and "" or " (could not clear the matchmaking flag)"))
+        elseif readValue(gameInstance, "IsMatchmaking") == "false" then
             local ok, err = pcall(function()
                 gameInstance:DecreaseMmr(gameInstance.MMR_DecreaseOnStart)
                 gameInstance:SetIsMatchMaking(true)
@@ -1519,6 +2094,10 @@ local function countAsMatchmaking()
             log("Match start counted (MMR, calibration " .. tostring(readValue(gameInstance, "MatchesPlayed"))
                 .. ", tasks): " .. (ok and "ok" or tostring(err)))
         end
+    elseif matchPlayedAt and not matchRanked and readValue(gameInstance, "IsMatchmaking") == "true" then
+        -- private game: nothing may turn the game's ranking (and its leave penalty) back on
+        pcall(function() gameInstance:SetIsMatchMaking(false) end)
+        log("Private game: matchmaking flag found set during the match, cleared")
     elseif matchPlayedAt and endScreenAt and endScreenAt > matchPlayedAt and os.clock() - endScreenAt > 3 then
         local okRecord, errRecord = pcall(writeMatchRecord, gameInstance)
         if not okRecord then log("Match record error: " .. tostring(errRecord)) end
@@ -1529,10 +2108,65 @@ local function countAsMatchmaking()
         matchmakingSet, matchPlayedAt, endScreenAt, matchOver = false, nil, nil, true
     end
 end
+-- Lobby report for the server (through the agent): the phase and who plays what. The server turns
+-- names into ranks for the launcher's server browser and never shows the names; quick play uses
+-- the roles (a killer search only goes where the killer slot is free).
+local function lobbyReport()
+    local players = {}
+    for _, pc in ipairs(propHuntControllers()) do
+        local ps = readObject(pc, "PlayerState")
+        local name = (readString(ps, "NickNamePS") or ""):gsub("[^%w_%-]", "")   -- account name (NamePS is the slot)
+        local killer = readValue(pc, "IsKiller") == "true" or readValue(ps, "IsKiller") == "true"
+        players[#players + 1] = string.format('{"name":"%s","role":"%s"}', name, killer and "killer" or "survivor")
+    end
+    return string.format('{"phase":"%s","players":[%s]}', inMatch() and "match" or "lobby", table.concat(players, ","))
+end
+
+-- Quick play found no game: the server picked this player to host a public one (order through the
+-- launcher: "hostpublic <map> <killer|survivor|any>"). The search is stopped and the map opened;
+-- in the first lobby a host who asked for survivor leaves the killer slot to the next player.
+local publicRole, publicRoleDone = nil, false
+local hostingSeen = false   -- the host has been in its hosted map (back in the menu = hosting ended)
+local function hostPublic(map, role)
+    local path = hostMaps[map]
+    local pc = localController()
+    if not path or not pc or not pc:GetFullName():find("PC_MainMenu_C", 1, true) then
+        log("Public game order ignored (" .. tostring(map) .. "): not in the menu or unknown map")
+        return
+    end
+    pcall(function() pc:CancelSearch() end)
+    if role ~= "killer" and role ~= "survivor" then role = math.random(2) == 1 and "killer" or "survivor" end
+    publicRole, publicRoleDone = role, false
+    lanRole, hostVisibility = "host", "public"
+    clearMatchmakingFlag()   -- the search may have set it; the mod sets it for the match itself
+    log("Quick play: hosting a public game on " .. map .. " as " .. role)
+    if online then
+        local ok, err = pcall(startRelayAgent, map, "public")
+        if not ok then log("Relay agent error: " .. tostring(err)) end
+    end
+    executeCommand("open " .. path .. "?listen?port=7777")
+end
+local function takePublicRole()
+    if publicRoleDone or publicRole ~= "survivor" or lanRole ~= "host" or inMatch() then return end
+    local pc = localController()
+    if not pc or not pc:GetFullName():find("PC_PropHunt_C", 1, true) then return end
+    local slot = readString(pc, "LobbySlotName") or ""
+    if slot == "" then return end
+    publicRoleDone = true
+    if not slot:find("killer", 1, true) then return end
+    local ok, err = pcall(function()
+        local gs = pc:GetWorld().GameState
+        gs:OnReleaseRequest(pc, slot, false)
+        gs:OnReserveRequest(pc, "surv1", false)
+    end)
+    log("Quick play: host moved to a survivor slot: " .. (ok and "ok" or tostring(err)))
+end
+
 local function runCommand(command)
     if command == "abbey" then executeCommand("open " .. abbey)
     elseif command == "host" then
-        lanRole = "host"
+        lanRole, hostVisibility = "host", "private"
+        clearMatchmakingFlag()
         executeCommand("open " .. abbey .. "?listen?port=7777")
     elseif command == "status" then snapshot()
     elseif command == "lobbydump" then
@@ -1552,8 +2186,13 @@ local function runCommand(command)
         if not chunk then log("lua compile error: " .. tostring(compileError)); return end
         local ok, result = pcall(chunk)
         log("lua: " .. tostring(ok) .. " " .. tostring(result))
+    elseif command and command:match("^hostpublic ") then
+        local map, role = command:match("^hostpublic (%w+) (%w+)")
+        hostPublic(map, role)
     elseif command and command:match("^invite ") then
         showInvite(command)
+    elseif command and command:match("^squadinvite ") then
+        showSquadInvite(command:match("^squadinvite ([%w_%-]+)"))
     elseif command and command:match("^missingmaps") then
         showMissingMaps(command:match("^missingmaps%s+(.-)%s*$"))
     elseif command and command:match("^joinrelay ") then
@@ -1573,6 +2212,7 @@ local function runCommand(command)
             if again then again:write(command); again:close() end
         else
             lanRole, menuSince = nil, nil
+            clearMatchmakingFlag()
             currentServer = relay .. ":" .. port
             log("Joining a friend's game on the relay, port " .. port)
             executeCommand("open " .. relay .. ":" .. port)
@@ -1581,6 +2221,7 @@ local function runCommand(command)
         local address = command:sub(6)
         if safeLanAddress(address) then
             lanRole, menuSince = "client", nil
+            clearMatchmakingFlag()
             currentServer = address .. ":7777"
             executeCommand("open " .. address .. ":7777")
         else log("Invalid LAN address") end
@@ -1647,8 +2288,141 @@ local function replaceOldChairs()
     end
     log("Incomplete chairs replaced by a fresh HypnoChairBP: " .. replaced .. "/" .. #old)
 end
+-- Possum's clone (CloneSpell, key E): the spell does not spawn it, it takes the first aiTest1 actor
+-- of the map (GetAllActorsOfClass, half a second after the killer appears), which every current map
+-- has placed in it. The classic maps are older than Possum: no clone, so E only showed "Teleport"
+-- and nothing happened. The host spawns one there when the map loads (state in social.clone), with
+-- its AI controller (a placed actor gets it by itself, a spawned one does not).
+local function placePossumClone()
+    if lanRole ~= "host" then return end
+    local pc = localController()
+    if not pc or pc:GetFullName():find("PC_MainMenu_C", 1, true) then return end
+    local world = pc:GetWorld()
+    local worldId = world:GetFullName() .. "@" .. tostring(world:GetAddress())
+    local st = social.clone
+    if st.world ~= worldId then st.world, st.since, st.done = worldId, os.clock(), false end
+    if st.done or os.clock() - st.since < 3 then return end
+    st.done = true
+    if not (worldId:find("PropNight_Map_TEST", 1, true) or worldId:find("Reborn_Mansion", 1, true)) then return end
+    for _, clone in pairs(FindAllOf("aiTest1_C") or {}) do
+        if clone:IsValid() and not clone:GetFullName():find("Default__", 1, true) then return end
+    end
+    local path = "/Game/Blueprints/Spell/Killer/test1/aiTest1.aiTest1_C"
+    local cls = StaticFindObject(path)
+    if not (cls and cls:IsValid()) then pcall(LoadAsset, "/Game/Blueprints/Spell/Killer/test1/aiTest1"); cls = StaticFindObject(path) end
+    if not (cls and cls:IsValid()) then log("Possum clone class not found"); return end
+    local ok, err = pcall(function()
+        local loc = pc.Pawn and pc.Pawn:IsValid() and pc.Pawn:K2_GetActorLocation()
+        local start = FindFirstOf("PlayerStart")
+        if start and start:IsValid() then loc = start:K2_GetActorLocation() end
+        loc = loc or { X = 0, Y = 0, Z = 0 }
+        local clone = world:SpawnActor(cls, { X = loc.X, Y = loc.Y, Z = loc.Z }, { Pitch = 0, Yaw = 0, Roll = 0 })
+        if not (clone and clone:IsValid()) then error("spawn failed") end
+        clone:SpawnDefaultController()
+        st.actor = clone
+    end)
+    log("Possum clone placed on this classic map: " .. (ok and "ok" or tostring(err)))
+end
+-- The clone runs with a behaviour tree whose MoveTo needs a NavMesh, which the classic maps do not
+-- have (built for maps without bots): there it stayed where it appeared. Once the spell shows it
+-- (mesh visible), the host runs it straight ahead (AIController.MoveToLocation without pathfinding,
+-- which needs no NavMesh) in the direction it was cast, and in a new direction each time a wall or
+-- the end of a run stops it, as the original roams.
+local function drivePossumClone()
+    local st = social.clone
+    local clone = st.actor
+    if lanRole ~= "host" or not (clone and clone:IsValid()) then return end
+    local okVis, visible = pcall(function() return clone.Mesh:IsVisible() end)
+    if not (okVis and visible) then st.running, st.last = false, nil; return end
+    local pos = clone:K2_GetActorLocation()
+    local moved = st.last and math.sqrt((pos.X - st.last.X) ^ 2 + (pos.Y - st.last.Y) ^ 2) or 0
+    st.last = { X = pos.X, Y = pos.Y }
+    if st.running and moved > 60 then return end   -- still running
+    local yaw
+    if not st.running then
+        local f = clone:GetActorForwardVector()   -- first run: where the killer was looking
+        yaw = math.deg(math.atan(f.Y, f.X))
+        st.running = true
+    else
+        yaw = (st.yaw or 0) + (math.random(0, 1) == 0 and 1 or -1) * math.random(90, 180)
+    end
+    st.yaw = yaw
+    local r = math.rad(yaw)
+    local ok, err = pcall(function()
+        clone.Controller:MoveToLocation({ X = pos.X + math.cos(r) * 2500, Y = pos.Y + math.sin(r) * 2500, Z = pos.Z }, 30,
+            false, false, false, false, nil, true)
+    end)
+    if not ok then log("Possum clone move error: " .. tostring(err)) end
+end
+-- Voice chat (Vivox, Mytona's account: the client makes its own login token). Players
+-- join the game's channel through PC.JoinVivoxRoom -> ClientJoinVoice("VoiceChat_" + id),
+-- which GM_PropHunt only runs on PlayFab servers, and the non-PlayFab id (GetServerID) is
+-- never set: every revival game would share "VoiceChat_". The host gives each hosted game
+-- its own channel and makes every player join it a few seconds after reaching each map.
+local voiceChannel = nil
+local voiceSeen = {}
+local function joinVoiceChannel()
+    local pc = localController()
+    if not pc or pc:GetFullName():find("PC_MainMenu_C", 1, true) then
+        voiceChannel, voiceSeen = nil, {}
+        return
+    end
+    if lanRole ~= "host" then return end
+    if not voiceChannel then
+        math.randomseed(os.time())
+        voiceChannel = string.format("VoiceChat_rv%d%04d", os.time(), math.random(0, 9999))
+        log("Voice channel for this game: " .. voiceChannel)
+    end
+    for _, player in ipairs(propHuntControllers()) do
+        local key = tostring(worldKey) .. "|" .. tostring(player:GetAddress())
+        local seen = voiceSeen[key]
+        if not seen then
+            voiceSeen[key] = os.clock()
+        elseif seen ~= true and os.clock() - seen >= 3 then
+            voiceSeen[key] = true
+            local ok, err = pcall(function() player:ClientJoinVoice(voiceChannel, 1) end)
+            local name = "?"
+            pcall(function() name = player.PlayerState:GetPlayerName():ToString() end)
+            log("Voice channel joined by " .. name .. ": " .. (ok and "ok" or tostring(err)))
+        end
+    end
+end
+-- Voice chat volume: the settings slider (0..1) goes to Vivox as -50..+50 (GI.Load and
+-- SoundSettings: MapRangeClamped(x*100, 100, 0, 50, -50)); above about +20 the voice is only
+-- loud distorted thumps. Same curve up to the middle (0.5 = 0, Vivox's normal volume),
+-- then up to +20 at the top. The slider is read from the open sound settings, else from
+-- the saved settings, and applied again whenever it changes and every 5 s (the game
+-- applies its own value when the settings load or the slider moves).
+local voiceGameInstance = nil
+local voiceVolumeSeen, voiceVolumeAt = nil, -10
+local function fixVoiceVolume()
+    local value = nil
+    for _, index in ipairs({ 8, 7 }) do
+        local objects = lobbyObjects(index)
+        for i = #objects, 1, -1 do
+            local ok, v = pcall(function() return objects[i].VoiceVolume end)
+            if ok and type(v) == "number" then value = v; break end
+        end
+        if value then break end
+    end
+    if not value then return end
+    if value == voiceVolumeSeen and os.clock() - voiceVolumeAt < 5 then return end
+    if not (voiceGameInstance and voiceGameInstance:IsValid()) then voiceGameInstance = FindFirstOf("GI_Prophunt_C") end
+    if not voiceGameInstance then return end
+    local volume = value <= 0.5 and math.floor(-50 + 100 * value + 0.5) or math.floor((value - 0.5) * 40 + 0.5)
+    local ok, err = pcall(function() voiceGameInstance:SetVoiceChatOutputVolume(volume) end)
+    if value ~= voiceVolumeSeen then
+        log(string.format("Voice chat volume %.2f -> %d: %s", value, volume, ok and "ok" or tostring(err)))
+    end
+    voiceVolumeSeen, voiceVolumeAt = value, os.clock()
+end
 local function slowTick()
     pollCount = pollCount + 1
+    local okSocial, errSocial = pcall(socialSync)
+    if not okSocial then log("Social sync error: " .. tostring(errSocial)) end
+    pcall(removeHalloweenLater)
+    local okFog, errFog = pcall(keepFarmFog)
+    if not okFog then log("Day farm fog error: " .. tostring(errFog)) end
     local ok, err = pcall(removeHalloweenSublevels)
     if not ok and cleanedWorld ~= "error" then
         cleanedWorld = "error"
@@ -1671,12 +2445,25 @@ local function slowTick()
     pcall(detectRole)
     if online and lanRole == "host" then
         local pc = localController()
-        if pc and not pc:GetFullName():find("PC_MainMenu_C", 1, true) then touchAliveFile() end
+        if pc and not pc:GetFullName():find("PC_MainMenu_C", 1, true) then
+            local okReport, report = pcall(lobbyReport)
+            touchAliveFile(okReport and report or nil)
+            hostingSeen = true
+        elseif pc and hostingSeen then
+            -- back in the menu after hosting: the agent unlists the game at once (quick play
+            -- must not send anyone, the host included, to a game nobody hosts any more)
+            touchAliveFile("closed")
+            hostingSeen, lanRole, publicRole = false, nil, nil
+            log("Hosting ended: game unlisted")
+        end
     end
     if lanRole then
         local okLan, errLan = pcall(maintainLanSession)
         if not okLan then log("LAN maintenance error: " .. tostring(errLan)) end
     end
+    local okClone, errClone = pcall(placePossumClone)
+    if not okClone then log("Possum clone error: " .. tostring(errClone)) end
+    pcall(drivePossumClone)
     local okChairs, errChairs = pcall(replaceOldChairs)
     if not okChairs then log("Chair replacement error: " .. tostring(errChairs)) end
     local okPresence, errPresence = pcall(writePresence)
@@ -1685,6 +2472,10 @@ local function slowTick()
     if not okEnd then log("End screen watch error: " .. tostring(errEnd)) end
     local okCount, errCount = pcall(countAsMatchmaking)
     if not okCount then log("Matchmaking flag error: " .. tostring(errCount)) end
+    local okRole, errRole = pcall(takePublicRole)
+    if not okRole then log("Public role error: " .. tostring(errRole)) end
+    local okVoice, errVoice = pcall(joinVoiceChannel)
+    if not okVoice then log("Voice channel error: " .. tostring(errVoice)) end
 end
 -- One timer drives the mod. UE4SS 3.0.1 runs ExecuteWithDelay callbacks on its own
 -- thread, on the game thread's Lua state: every ExecuteInGameThread made there adds
@@ -1694,6 +2485,47 @@ end
 -- function"). The mod made about 33 of these calls per second in the lobby; now
 -- one per tick (4 per second in the lobby, 2 in the menu, 1 in a match), and the
 -- timer callback does nothing else.
+-- Lobby scene placement (developer tool, needs Win64/revival-dev.txt): the placement
+-- window (revival/tools/lobby_place.ps1) appends "forward right up yaw" moves to
+-- revival-lobbymove.txt, relative to the current view; the whole scene (characters and
+-- camera) moves, and its position is written to revival-lobbypos.txt to bake it in the map.
+local lobbyMoveFile = win64 .. "/revival-lobbymove.txt"
+local function moveLobbyScene()
+    local work = lobbyMoveFile .. ".work"
+    if not os.rename(lobbyMoveFile, work) then return end
+    local file = io.open(work, "r")
+    local text = file and file:read("*a") or ""
+    if file then file:close() end
+    os.remove(work)
+    local dev = io.open(win64 .. "/revival-dev.txt", "r")
+    if not dev then return end
+    dev:close()
+    local lobby = FindFirstOf("NewLobbyV2_C")
+    if not lobby or not lobby:IsValid() then log("Lobby placement: no scene"); return end
+    pcall(function() lobby:K2_GetRootComponent():SetMobility(2) end)
+    local loc, rot = lobby:K2_GetActorLocation(), lobby:K2_GetActorRotation()
+    local x, y, z, yaw = loc.X, loc.Y, loc.Z, rot.Yaw
+    local okView, view = pcall(function() return localController().PlayerCameraManager:GetCameraRotation().Yaw end)
+    local a = math.rad(okView and view or yaw)
+    local scale = lobby:GetActorScale3D().X
+    for line in text:gmatch("[^\n]+") do
+        local f, r, u, turn, grow = line:match("(%S+)%s+(%S+)%s+(%S+)%s+(%S+)%s*(%S*)")
+        f, r, u, turn = tonumber(f) or 0, tonumber(r) or 0, tonumber(u) or 0, tonumber(turn) or 0
+        scale = scale * (tonumber(grow) or 1)
+        x = x + f * math.cos(a) - r * math.sin(a)
+        y = y + f * math.sin(a) + r * math.cos(a)
+        z, yaw = z + u, yaw + turn
+    end
+    lobby:K2_SetActorLocationAndRotation({ X = x, Y = y, Z = z }, { Pitch = rot.Pitch, Yaw = yaw, Roll = rot.Roll }, false, {}, true)
+    lobby:SetActorScale3D({ X = scale, Y = scale, Z = scale })
+    local where = lobby:GetFullName():match("([%w_]+):PersistentLevel") or "?"
+    local now = lobby:K2_GetActorLocation()
+    local out = io.open(win64 .. "/revival-lobbypos.txt", "w")
+    if out then
+        out:write(string.format("%s %.4f %.4f %.4f %.4f %.4f\n", where, now.X, now.Y, now.Z, lobby:K2_GetActorRotation().Yaw, lobby:GetActorScale3D().X))
+        out:close()
+    end
+end
 local tickDelay = 1000
 local lastSlowTick = -10
 local function gameTick()
@@ -1706,7 +2538,12 @@ local function gameTick()
     end
     local ok, err = pcall(fastTick)
     if not ok then log("Lobby tick error: " .. tostring(err)) end
+    local okPlace, errPlace = pcall(moveLobbyScene)
+    if not okPlace then log("Lobby placement error: " .. tostring(errPlace)) end
+    local okVolume, errVolume = pcall(fixVoiceVolume)
+    if not okVolume then log("Voice volume error: " .. tostring(errVolume)) end
     if lanRole and not inMatch() then tickDelay = 250
+    elseif maddyLock.active then tickDelay = 250  -- host plays Maddy: katana locks are caught quickly
     elseif menuWatch.pc and not menuWatch.done then tickDelay = 500
     else tickDelay = 1000 end
 end

@@ -21,7 +21,7 @@ ROOT = REVIVAL.parent
 REPAK = str(REVIVAL / "tools/repak-v0.2.3/repak.exe")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from paks_key import KEY  # noqa: E402  (game pak AES key, not in the source)
-GAME_PAK = ROOT / "Propnight/Propnight/Content/Paks/Propnight-WindowsNoEditor.pak"
+from game_root import GAME_PAK  # noqa: E402  (reference install)
 OLD_HOST = "ddkkakl4x2.execute-api.eu-central-1.amazonaws.com"
 ASSETS = [
     "Propnight/Content/Blueprints/GI_Prophunt",
